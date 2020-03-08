@@ -1,0 +1,532 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jul 16 09:39:19 2019
+
+@author: NiTro
+"""
+
+import keras
+import csv
+import numpy 
+import keras.models
+from keras.models import Sequential
+from keras.models import Model
+from keras.layers import Dense,Dropout, Activation, Flatten, Input, Lambda, Concatenate
+from keras.layers import Convolution2D, MaxPooling2D, Convolution1D
+from keras.callbacks import EarlyStopping
+from keras import metrics
+import keras.backend as K
+import keras.utils.np_utils as np_utils
+import datetime
+import pickle
+import os
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import warnings
+import sys
+import pandas as pd
+import multiprocessing
+
+#new over previous version: batch training (with multiprocessing)
+#changes over V0.1.3: attempt to identify fix bug from nates triangle script
+#changes over V0.1.4: fixed but where terminate_on_nan would pickle the call back
+
+class Xae:
+    def __init__(self,description_data = None,target_data = None,epochs = None,
+                 arch = None,
+                 model_file_name = None,**kwargs):
+    ###must include:
+    #description_data
+    #target_data (optional,but if you want to target it must be included :P)
+    #arch
+    #epochs
+    #OR:
+    #model_file_name
+    ###recomended include
+    #latent_dim (set to default so something reasonable but worth thinking about)
+    #savefolder
+    #######
+    #initializes a single xae (could be a vanilla vae or up to a xae with free latent nodes)
+    ##giving a model_file_name assumes the file exists and loads that model
+    #otherwise a model is traied
+        #note model file name should not include a file exentsion but should include the folder.
+        #if will ofthe look like /some/path/<time_stamp>
+    ##training:
+    #inputs: description_data, target_data (optional),epochs
+        #description_data: is description of the system this is saved by default but is memory intensive
+            #should be a 2d numpy array which is a list of descriptions 
+            #description data should be normalized before it is given to this function if that is what you want
+        #target_data: the model will relate description_data to target data (this is optional)
+            #should be a 2d numpy array which is a list of descriptions 
+        #pickle_description: data may be turned off but will require you 
+            #to provide the training data on loading of th model
+        #note: latent_dim - len(latent_targets.trainset) = free latent nodes
+        #note: assert latent_dim > len(latent_targets.trainset)
+        #note: len(target?(used to say testset)) is allowed to be 0 wich results in a vanilla autoencoder
+        #recon_loss_type: is only 'mse' or
+            #recon_loss_type can be a keras.losses.loss_function(orig,recon)
+            #note target_loss_type is only mse right now will have to be updated to include xentropy
+        #target_loss_type: can be a keras.losses.loss_function(target,target_pred)
+        #dense_activation: can be any keras activation, default: 'relu'. See keras documentation
+    #model parameters: arch,batch_size,recon_weight,kl_weigth,target_weight,
+        #latent_dim,recon_loss_type,dense_activation
+    #output parameters: savefolder,save,plot_history,return_history,
+        #save_history,notes,
+        #save folder should end in a / (as folders do)
+    #misc parameters: clear_session,debug
+
+    
+        #give default vlues, if a value is initialized via a kwarg it is 
+        #initialized in a loop bellow
+        self.xae = None
+        self.encoder = None
+        self.decoder = None
+        self.history = None
+        self.model_file_name = model_file_name
+        #training data
+        self.description_data = description_data
+        self.target_data = target_data
+        self.save_training_data = 1 
+        #test data
+        self.description_data_test = None
+        self.target_data_test = None
+        #model params
+        self.latent_dim = None
+        self.arch = arch
+        self.batch_size = None
+        self.epochs = epochs
+        self.original_dim = None
+        self.recon_weight = 1
+        self.kl_weight = 1
+        self.target_weight = 1
+        self.dense_activation = 'relu'
+        self.recon_loss_type = 'mse' #might want to change this
+        self.target_loss_type = 'mse' #might want to change this
+        self.terminate_on_nan = 0
+        self.savefolder = 'default'#
+        self.save = 1
+        self.plot_history = 0
+        self.notes = ''
+        self.clear_session = 0
+        self.debug = 0  
+        loading = 0
+        ##initialize kwargs
+        if model_file_name is not None:
+            loading = 1
+            if model_file_name[-4] == '.':#remove file exention if one was given
+                model_file_name = model_file_name[:-4]
+            with open(model_file_name+'.pickle','rb') as load:
+                params = pickle.load(load)
+            for key,value in params.items():
+                setattr(self,key,value)
+            if self.description_data is None:
+                warnings.warn('you have loaded a model with out training data, and no training data was loaded')   
+        #over ride any atributes which were given on initalization I'm not sure i love this beheivor...
+        for key,value in kwargs.items():
+            setattr(self,key,value)    
+        self.model_file_name = model_file_name #fixes a glitch
+#            #where it loads the file name at training instead of the file name
+#            #at loading this is an issue when the file has been moved
+        ##setup
+        #check that essiential values are set
+        if None in (self.arch,self.epochs):
+            raise ValueError('arch, epochs must be defined')
+        #check shape of target data
+        if self.target_data is not None:
+            if len(self.target_data.shape) != 2:
+                raise ValueError('target data must be 2 dimentional, likely this is a matter of target_data.reshape((-1,1))')
+        #auto detect latent dim and latent target dim if not given 
+        if self.target_data is not None:
+            self.latent_target_dim = len(self.target_data[0])
+            if self.latent_dim == None:
+                self.latent_dim = self.latent_target_dim
+        elif self.latent_dim == None:
+            raise ValueError('You need to spcecify latent dim')  
+        else:
+            self.latent_target_dim = 0
+        #determine the dimention of the free dimention and verify it is possible
+        self.latent_free_dim = self.latent_dim-self.latent_target_dim
+        if self.latent_free_dim < 0:
+            raise ValueError('the latent space must be able to hold all targets\n'+\
+                             'latent_dim:'+str(self.latent_dim)+' len(latent_targets[0]):'+\
+                             str(len(self.target_data[0]))+'\n'+\
+                             'laten_free_dim:'+str(self.latent_free_dim))
+        #make sure save folder exists
+        if self.savefolder is None:
+            self.savefolder = 'default/'
+        if not os.path.exists(self.savefolder):
+            os.makedirs(self.savefolder)
+        #detect orginal dim
+        if self.original_dim is None:
+            self.original_dim = len(self.description_data[0])    
+        #clear session
+        if (self.clear_session == 1):
+            K.clear_session()
+        #terminate on nan
+        if self.terminate_on_nan:
+            self.callbacks = [keras.callbacks.TerminateOnNaN()]
+        else:
+            self.callbacks = []
+        ##building xae
+        input_layer = Input(shape = (self.original_dim,),name = 'xae_input')
+        h_en = [Dense(self.arch[0],activation=self.dense_activation)(input_layer)]
+        for i in self.arch[1::]:#compile and store hidden layers
+            h_en.append(Dense(i,activation = self.dense_activation)(h_en[-1]))       
+        if not self.latent_target_dim: #if there is no targets, only have lat space
+            z_free = Dense(self.latent_free_dim)(h_en[-1])
+            z_mean = z_free
+            z_log_var_free = Dense(self.latent_free_dim)(h_en[-1])
+            z_log_var = z_log_var_free
+        elif not self.latent_free_dim:#if there is no free dim only have targted lat space
+            z_target = Dense(self.latent_target_dim)(h_en[-1])
+            z_mean = z_target
+            z_log_var_target = Dense(self.latent_target_dim)(h_en[-1])
+            z_log_var = z_log_var_target
+        else:#have both targted and free lat nodes
+            z_free = Dense(self.latent_free_dim)(h_en[-1])
+            z_target = Dense(self.latent_target_dim)(h_en[-1])
+            z_mean = Concatenate(name = 'z_mean')([z_target,z_free])
+            z_log_var_target = Dense(self.latent_target_dim)(h_en[-1])   
+            z_log_var_free = Dense(self.latent_free_dim)(h_en[-1])
+            z_log_var = Concatenate(name = 'z_log_var')([z_log_var_target,z_log_var_free])    
+        #reparameterization trick (kingma paper)
+        epsilon_std = 1.0   
+        def sampling(args):
+            z_mean, z_log_var = args
+            batch = K.shape(z_mean)[0]
+            dim = K.int_shape(z_mean)[1]
+            epsilon = K.random_normal(shape=(batch, dim), mean=0.,
+                              stddev=epsilon_std)
+            return z_mean + K.exp(0.5 * z_log_var) * epsilon     
+        #latent space is sampled according the the z_means from before
+        z = Lambda(sampling, output_shape=(self.latent_dim,))([z_mean,z_log_var])
+        #reverse the arch list to build up decoder half of autoencoder
+        self.arch.reverse()    
+        h_de_layer = [Dense(self.arch[0],activation = self.dense_activation)]
+        h_de = [h_de_layer[-1](z)]
+        for i in self.arch[1::]:
+            h_de_layer.append(Dense(i,activation = self.dense_activation))
+            h_de.append(h_de_layer[-1](h_de[-1]))
+        decoder_mean = Dense(self.original_dim,activation= 'sigmoid')
+        x_decoded_mean = decoder_mean(h_de[-1])#decoded output
+        self.arch.reverse() #unreverse :P
+        #instantiate encoder
+        self.encoder = keras.models.Model(input_layer,[z_mean,z_log_var],name = 'encoder')
+        #build decoder (this must be done to add an input layer, unlike the encoder)
+        decoder_input = Input(shape = (self.latent_dim,))    
+        _h_de = [h_de_layer[0](decoder_input)]
+        for i in h_de_layer[1::]:
+            _h_de.append(i(_h_de[-1])) 
+        decoded = decoder_mean(_h_de[-1])
+        #instantiate decoder
+        self.decoder = keras.models.Model(decoder_input, decoded,name = 'decoder') 
+        #instantiate autoencoder, inputs depend on if there are targeted nodes
+        if self.latent_target_dim:
+            targets = Input(shape = (self.latent_target_dim,))
+            self.xae = keras.models.Model(inputs = [input_layer,targets],outputs=x_decoded_mean)
+        else:
+            self.xae = keras.models.Model(inputs = input_layer,outputs=x_decoded_mean)
+        ##set up loss functions   
+        #recon loss
+        if self.recon_loss_type == 'mse':
+            recon_loss = keras.losses.mse(input_layer,x_decoded_mean)
+        elif callable(self.recon_loss_type):
+            recon_loss = self.recon_loss_type(input_layer,x_decoded_mean)
+        else:
+            raise ValueError('you choose a recon loss which is not currently supported\
+                             currnly only mse works')
+        recon_loss = K.mean(recon_loss*self.original_dim)*self.recon_weight
+        self.xae.add_loss(recon_loss)
+        #kl_loss
+        if self.latent_free_dim:
+            kl_loss_free = - 0.5 * K.sum(1 + z_log_var_free - K.square(z_free)- K.exp(z_log_var_free), axis=-1)
+        if self.latent_target_dim:
+            kl_loss_target = - 0.5 * K.sum(1 + z_log_var_target - K.exp(z_log_var_target), axis=-1)
+        if self.latent_free_dim and self.latent_target_dim:
+            kl_loss = kl_loss_free + kl_loss_target
+        elif self.latent_target_dim:
+            kl_loss = kl_loss_target
+        elif self.latent_free_dim:
+            kl_loss = kl_loss_free
+        kl_loss *= self.kl_weight
+        kl_loss = K.mean(kl_loss)
+        self.xae.add_loss(kl_loss)
+        #target_loss
+        if self.latent_target_dim: #only use target loss if we have targets...duh
+            if self.target_loss_type == 'mse':
+                target_loss = keras.losses.mse(targets,z_target)
+            elif callable(self.target_loss_type):
+                target_loss = self.target_loss_type(targets,z_target)
+            else:
+                raise ValueError('you chose a target_loss_type which is not currenlty support')
+            target_loss = K.mean(target_loss)*self.target_weight
+            self.xae.add_loss(target_loss)
+        ##compile
+        self.xae.compile(optimizer='adam')
+        #add metrics for each loss
+        self.xae.metrics_tensors.append(recon_loss)
+        self.xae.metrics_names.append('recon_loss')
+        self.xae.metrics_tensors.append(kl_loss)
+        self.xae.metrics_names.append('kl_loss')
+        if self.latent_target_dim:#only use target loss if we have targets...still
+            self.xae.metrics_tensors.append(target_loss)
+            self.xae.metrics_names.append('target_loss')
+        ##training xae
+        #xae,encoder,and decoder have been defined
+        if not loading:
+            print('You may begin your training young padawan')
+            print('fitting started')
+            if self.latent_target_dim:#also only have targets if we have (...you guessed it) targets
+                history_t = self.xae.fit([self.description_data,self.target_data],
+                        shuffle=True,
+                        callbacks = self.callbacks,
+                        epochs=self.epochs,
+                        batch_size=self.batch_size)
+            else:
+                history_t = self.xae.fit(self.description_data,
+                        shuffle=True,
+                        callbacks = self.callbacks,
+                        epochs=self.epochs,
+                        batch_size=self.batch_size)
+            self.history = history_t.history
+            print('fitting ended')
+            ##logging and saving
+            if self.plot_history == 1:
+                plt.plot(self.history.history['loss'])
+                plt.show()
+            timestamp = datetime.datetime.now().strftime('%b-%d-%H.%M.%f')
+            logfile = self.savefolder+r'/'+timestamp+'.log'
+            self.model_file_name = self.savefolder+'/'+timestamp
+            with open(logfile,'a') as log:
+                pickleables_t = vars(self)
+                self.pickleables = pickleables_t.copy()
+                self.pickleables.pop('encoder')
+                self.pickleables.pop('decoder')
+                self.pickleables.pop('xae')
+                self.pickleables.pop('callbacks')
+                self.logables = self.pickleables.copy()
+                if not self.save_training_data:
+                    self.pickleables.pop('description_data')
+                self.logables.pop('description_data')
+                self.logables.pop('target_data')
+                self.logables.pop('history')
+                logentry = ''
+                for key,value in self.logables.items():
+                    logentry = logentry + '{}={}\t'.format(key,value)                    
+                for loss in self.history.keys():
+                    logentry = logentry + str(loss)+'={}\t'.format(self.history[loss][-1])
+                logentry = logentry + '\n'
+                log.write(logentry)
+            if self.save:
+                self.encoder.save(self.model_file_name+'_encoder.h5')
+                self.decoder.save(self.model_file_name+'_decoder.h5')
+                self.xae.save_weights(self.model_file_name+'_xae_weights.h5')
+                with open(self.model_file_name+'.pickle','wb') as save:
+                    for var in self.pickleables:
+                        print('{}: \t{}'.format(var,self.pickleables[var]))
+#                    print(self.pickleables)
+                    pickle.dump(self.pickleables,save)  
+        if loading:
+            self.encoder = keras.models.load_model(self.model_file_name+'_encoder.h5')
+            self.decoder = keras.models.load_model(self.model_file_name+'_decoder.h5')
+            self.xae.load_weights(self.model_file_name+'_xae_weights.h5')
+    
+    def encode(self,data = None):
+        #if no data is given returns the encoded training data
+        if data is None:
+            data = self.description_data
+        else:
+            data = data.reshape((len(data),-1))
+        return self.encoder.predict_on_batch(data)[0]#only get mean (not z_log_var)
+    
+#    getLatSpace = encode #back compatablilty 
+    
+    def get_sigma(self,data = None):
+        if data is None:
+            data = self.description_data
+        else:
+            data = data.reshape((-1,self.description_data.shape[-1]))
+        return self.encoder.predict_on_batch(data)[1]#only get z_log_var (not z_mean)
+        
+    
+    def decode(self,data = None):
+        #if not data is given returns the decoded training data
+        if data is None:
+            data = self.encode()[0]#only get mean (not z_log_var)
+        else:
+            data.reshape((-1,self.latent_dim))
+        return  self.decoder.predict_on_batch(data)
+    
+    def inter_range_ls(self, data = None):
+        self.inner_data = self.encode(data)
+        self.ranges = []
+        for i in range(self.latent_dim):
+            self.ranges.append([min(self.inner_data.transpose()[i]),max(self.inner_data.transpose()[i])])
+        return self.ranges
+            
+    
+    def generate_grid(self, partitions = 2, data = None, indices = [0,1], return_grid = 'N'):
+        self.inner_data = self.encode(data)
+        self.inter_range_ls(data)
+        self.splits = []
+        self.grid = []
+        for i in self.ranges:
+            self.splits.append(float((i[1]-i[0])/partitions))
+            
+        self.set_one = (self.ranges[indices[0]][0],self.ranges[indices[0]][1],self.splits[indices[0]])
+        self.set_two = (self.ranges[indices[1]][0],self.ranges[indices[1]][1],self.splits[indices[1]])
+        
+        self.xx = numpy.arange(self.set_one[0],self.set_one[1],self.set_one[2])
+        self.yy = numpy.arange(self.set_two[0],self.set_two[1],self.set_two[2])
+        self.grid_one = numpy.meshgrid(self.xx,self.yy)
+        self.grid = numpy.asarray([self.grid_one[0].flatten(),self.grid_one[1].flatten()]).transpose()
+        self.decoded_grid = self.decode(self.grid)
+        
+        return self.decoded_grid
+
+
+def train_cae_from_file(description_data_fn,target_data_fn,arch,**kwargs):
+#description_data and target_data should be filepaths to csv files
+    #each row should be a measuremnt
+    #each column should be a feature
+#target_data should be a list of indicies for each classification (this function takes care of 'to_categorical')
+#allowed kwargs are defined in Xae.__init__()
+    description_data = csv.reader(open(description_data_fn,'rb'),delimiter = ',')
+    description_data = numpy.array(list(description_data)).astype('float')
+    target_data = csv.reader(open(target_data_fn,'rb'),delimiter = ',')
+    target_data = numpy.array(list(target_data)).astype('float')
+    target_data = keras.utils.to_categorical(target_data)
+    if 'target_loss_type' not in kwargs:
+        if len(target_data[0]) == 2:
+            target_loss_type = keras.losses.binary_crossentropy
+        elif len(target_data[0]) > 2:
+            target_loss_type = keras.losses.categorical_crossentropy
+        else:
+            raise ValueError('I am detecting a single category in your targets')
+    cae = Xae(description_data,target_data,arch = arch,
+              target_loss_type = target_loss_type,**kwargs)
+    return cae
+
+def train_pae_from_file(description_data_fn,target_data_fn,arch,**kwargs):
+#description_data and target_data should be filepaths to csv files
+    #each row should be a measuremnt
+    #each column should be a feature
+#target_data is assumed to be one dimentional, and one free node is allowed
+    #this can be over writtin with kwargs
+#allowed kwargs are defined in Xae.__init__()
+    description_data = csv.reader(open(description_data_fn,'rb'),delimiter = ',')
+    description_data = numpy.array(list(description_data)).astype('float')
+    target_data = csv.reader(open(target_data_fn,'rb'),delimiter = ',')
+    target_data = numpy.array(list(target_data)).astype('float')
+    if 'latent_dim' not in kwargs:
+        latent_dim = 2
+    if len(target_data.shape) == 1:
+        target_data.reshape((-1,1))
+    pae = Xae(description_data=description_data,target_data = target_data,
+              arch = arch,latent_dim = latent_dim)
+    return pae
+
+def train_xae(kwargs):
+    index = kwargs.pop('index')
+    save_lock = kwargs.pop('save_lock')
+    savefolder = kwargs['savefolder']
+    save_log = savefolder+'batch_train.log'
+#    print('starting training')
+    with open(savefolder+'model_index'+str(index)+'.out','w') as out:
+        sys.stdout = out
+        print('log test')
+        print(kwargs)
+        model = Xae(**kwargs)
+        print('Starting Loop')
+        with open(model.model_file_name+'.log','r') as read:
+            data_orig = read.readline()
+        data_orig = data_orig.strip().split('\t')
+        data = [datum.split('=')[1] for datum in data_orig]
+        data.append(str(index))
+        logentry = '\t'.join(data)
+        logentry = logentry + '\n'
+        print('aquiring lock')
+        save_lock.acquire()
+        try:
+            print('lock aquired')
+            if not os.path.exists(save_log):
+                with open(save_log,'w') as log:
+                    header = [datum.split('=')[0] for datum in data_orig]
+                    header.append('index')
+                    header = '\t'.join(header)
+                    print('header:{}'.format(header))
+                    log.write(header+'\n')
+            print(save_log)
+            print(logentry)
+            with open(save_log,'a') as log:
+                log.write(logentry)            
+        finally:
+            save_lock.release()
+            print('lock released' )
+    return model.model_file_name
+    
+def batch_train(params,trys,num_workers,savefolder='default/',stop = None):
+    #params are fed direclty into core.Xae(), see that class for list of params
+    #prams is a dict of lists. all combinations of the lits are trained
+    #tries is the number of tries for each configuration
+    #save_log: the file to save progress log. Models are only logged once
+    #they have been finished and saved
+    #stop: number of paramsets to do, useful for only testing like two params sets
+    os.makedirs(os.path.dirname(savefolder),exist_ok = True)
+    try:
+        log_df = pd.read_csv(savefolder+'batch_train.log',sep = '\t')
+        print('\n\n\n****restarting run***\n\n\n')
+        remove = log_df['index']
+    except FileNotFoundError:
+        print('\n\n\n****Starting new run***\n\n\n')
+        remove = []
+    #    with open(save_log,'w') as log:
+    #        log.write('\t'.join(loggables))
+    #        log.write('\n')
+    def start_loop(d,trys,keys,param_set,param_list):
+        if len(d) != 0:
+            param_set = dict(param_set)
+            d = d.copy()
+            keys = keys.copy()
+            values = d.pop(keys[0])
+            key = keys[0]
+            keys.remove(key)
+            for value in values:
+                param_set[key] = value
+                start_loop(d,trys,keys,param_set,param_list)
+        else:
+            for tri in range(trys):
+#                print('index:{}'.format(len(param_list)))
+#                print('tri:{}'.format(tri))
+                param_set = dict(param_set)
+                param_set['index'] = len(param_list)
+                param_list.append(param_set)
+            return 
+    #generate param list
+    keys = sorted(params.keys())
+    param_list = []
+    start_loop(params,trys,keys,{},param_list)
+    print('Number of param sets:{}'.format(len(param_list)))
+    remove = sorted(remove,reverse = True)
+    for r in remove:
+        del param_list[r]
+    if stop is not None:
+        param_list = param_list[:stop]    
+    print('making manager')
+    m = multiprocessing.Manager()
+    print('making pool')
+    p = multiprocessing.Pool(num_workers)
+    print('pool made')
+    save_lock = m.Lock()
+    print('lock made')
+    for param_set in param_list:
+        param_set['save_lock'] = save_lock
+        param_set['savefolder'] = savefolder
+    print('starting mapping')
+    print(param_list[0])
+    print('save_lock:{}'.format(save_lock))
+    file_names = p.map(train_xae,param_list)
+    p.close()
+    p.join()
+    return file_names
+    
